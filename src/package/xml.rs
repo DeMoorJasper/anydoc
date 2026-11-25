@@ -202,10 +202,10 @@ impl<'a> Iterator for DescendantNodes<'a> {
 /// consistent encoding.
 pub fn parse_xml(bytes: &[u8]) -> Result<Element, ConvertError> {
     let utf8 = to_utf8(bytes);
-    let mut reader = NsReader::from_reader(utf8.as_ref());
+    let mut reader = NsReader::from_str(&utf8);
     reader.config_mut().check_end_names = false;
 
-    let mut interner: HashMap<Vec<u8>, Rc<str>> = HashMap::new();
+    let mut interner: HashMap<Box<str>, Rc<str>> = HashMap::new();
     let mut root =
         Element { ns: None, local: String::new(), attrs: Vec::new(), children: Vec::new() };
     let mut stack: Vec<Element> = Vec::new();
@@ -234,7 +234,7 @@ pub fn parse_xml(bytes: &[u8]) -> Result<Element, ConvertError> {
             }
             Event::End(end) => match stack.pop() {
                 Some(elem) => {
-                    if elem.local.as_bytes() != end.local_name().as_ref() {
+                    if elem.local != end.local_name().as_ref() {
                         recovered = true;
                     }
                     attach(&mut stack, &mut root, Node::Elem(elem));
@@ -242,23 +242,20 @@ pub fn parse_xml(bytes: &[u8]) -> Result<Element, ConvertError> {
                 None => recovered = true,
             },
             Event::Text(e) => {
-                let text = match e.decode() {
-                    Ok(t) => t.into_owned(),
-                    Err(_) => String::from_utf8_lossy(e.as_ref()).into_owned(),
-                };
+                let text = e.as_ref().to_string();
                 if !text.is_empty() {
                     bump_nodes(&mut nodes)?;
                     push_text(&mut stack, &mut root, text);
                 }
             }
             Event::GeneralRef(e) => {
-                let name = String::from_utf8_lossy(e.as_ref()).into_owned();
+                let name = e.as_ref().to_string();
                 let resolved = resolve_entity(&name).unwrap_or_else(|| format!("&{name};"));
                 bump_nodes(&mut nodes)?;
                 push_text(&mut stack, &mut root, resolved);
             }
             Event::CData(e) => {
-                let text = String::from_utf8_lossy(e.as_ref()).into_owned();
+                let text = e.as_ref().to_string();
                 bump_nodes(&mut nodes)?;
                 push_text(&mut stack, &mut root, text);
             }
@@ -279,18 +276,18 @@ pub fn parse_xml(bytes: &[u8]) -> Result<Element, ConvertError> {
 }
 
 /// Transcode an XML part to UTF-8 based on its BOM or encoding declaration.
-fn to_utf8(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+fn to_utf8(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     match bytes {
         [0xFF, 0xFE, ..] => {
             let (s, _, _) = encoding_rs::UTF_16LE.decode(bytes);
-            Cow::Owned(s.into_owned().into_bytes())
+            Cow::Owned(s.into_owned())
         }
         [0xFE, 0xFF, ..] => {
             let (s, _, _) = encoding_rs::UTF_16BE.decode(bytes);
-            Cow::Owned(s.into_owned().into_bytes())
+            Cow::Owned(s.into_owned())
         }
-        [0xEF, 0xBB, 0xBF, rest @ ..] => Cow::Borrowed(rest),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest),
         _ => {
             // Sniff a non-UTF-8 encoding declaration in the XML prolog.
             let head = &bytes[..bytes.len().min(200)];
@@ -299,9 +296,9 @@ fn to_utf8(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
                 && enc != encoding_rs::UTF_8
             {
                 let (s, _, _) = enc.decode(bytes);
-                return Cow::Owned(s.into_owned().into_bytes());
+                return Cow::Owned(s.into_owned());
             }
-            Cow::Borrowed(bytes)
+            String::from_utf8_lossy(bytes)
         }
     }
 }
@@ -345,27 +342,26 @@ pub fn normalize_ooxml_uri(uri: &str) -> Option<String> {
     Some(format!("http://schemas.openxmlformats.org/{family}/2006/{tail}"))
 }
 
-fn intern(interner: &mut HashMap<Vec<u8>, Rc<str>>, uri: &[u8]) -> Rc<str> {
+fn intern(interner: &mut HashMap<Box<str>, Rc<str>>, uri: &str) -> Rc<str> {
     if let Some(rc) = interner.get(uri) {
         return rc.clone();
     }
-    let raw = String::from_utf8_lossy(uri).into_owned();
-    let rc: Rc<str> = Rc::from(normalize_ooxml_uri(&raw).unwrap_or(raw));
-    interner.insert(uri.to_vec(), rc.clone());
+    let rc: Rc<str> = Rc::from(normalize_ooxml_uri(uri).unwrap_or_else(|| uri.to_string()));
+    interner.insert(uri.into(), rc.clone());
     rc
 }
 
 fn start_to_element(
     e: &BytesStart,
     reader: &NsReader<&[u8]>,
-    interner: &mut HashMap<Vec<u8>, Rc<str>>,
+    interner: &mut HashMap<Box<str>, Rc<str>>,
 ) -> Element {
     let (res, local) = reader.resolver().resolve_element(e.name());
     let ns = match res {
         ResolveResult::Bound(namespace) => Some(intern(interner, namespace.as_ref())),
         _ => None,
     };
-    let local = String::from_utf8_lossy(local.as_ref()).into_owned();
+    let local = local.as_ref().to_string();
     let mut attrs = Vec::new();
     for attr in e.attributes() {
         let attr = match attr {
@@ -378,7 +374,12 @@ fn start_to_element(
         };
         // Namespace declarations are consumed by the reader's resolver; the
         // DOM stores only resolved names.
-        if attr.key.as_ref().strip_prefix(b"xmlns").is_some_and(|r| matches!(r, [] | [b':', ..])) {
+        if attr
+            .key
+            .as_ref()
+            .strip_prefix("xmlns")
+            .is_some_and(|r| r.is_empty() || r.starts_with(':'))
+        {
             continue;
         }
         let (res, alocal) = reader.resolver().resolve_attribute(attr.key);
@@ -387,14 +388,10 @@ fn start_to_element(
             _ => None,
         };
         let value = attr
-            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map(|v| v.into_owned())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).into_owned());
-        attrs.push(Attr {
-            ns: ans,
-            local: String::from_utf8_lossy(alocal.as_ref()).into_owned(),
-            value,
-        });
+            .unwrap_or_else(|_| attr.value.to_string());
+        attrs.push(Attr { ns: ans, local: alocal.as_ref().to_string(), value });
     }
     // `mc:Choice/@Requires` holds namespace *prefixes* evaluated in the
     // element's lexical scope (prefixes may be rebound locally). Resolve
@@ -410,9 +407,9 @@ fn start_to_element(
             .split_whitespace()
             .map(|prefix| {
                 let probe = format!("{prefix}:x");
-                match reader.resolver().resolve_element(QName(probe.as_bytes())).0 {
+                match reader.resolver().resolve_element(QName(probe.as_str())).0 {
                     ResolveResult::Bound(namespace) => {
-                        let raw = String::from_utf8_lossy(namespace.as_ref()).into_owned();
+                        let raw = namespace.as_ref().to_string();
                         normalize_ooxml_uri(&raw).unwrap_or(raw)
                     }
                     _ => prefix.to_string(),
